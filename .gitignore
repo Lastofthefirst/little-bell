@@ -24,3 +24,20 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Docker
+.dockerignore
+
+# Temporary files
+/tmp
+
+# SSL certificates (for local development)
+ssl/
+
+# Coverage reports
+coverage/
+*.profraw
+
+# Backup files
+*.bak
+*.backup
