@@ -9,10 +9,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_http::compression::CompressionLayer;
+use tower_http::{compression::CompressionLayer, trace::TraceLayer, cors::CorsLayer};
+use tracing::{info, warn};
 
 pub mod database;
+pub mod error;
+
 use database::{Database, EventStats};
+use error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -67,7 +71,7 @@ struct DashboardTemplate {
 }
 
 #[derive(Deserialize)]
-struct ClickQuery {
+pub(crate) struct ClickQuery {
     url: String,
 }
 
@@ -87,21 +91,71 @@ pub async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "healthy",
         "service": "little-bell",
-        "version": "0.1.0"
+        "version": "0.1.0",
+        "timestamp": chrono::Utc::now().to_rfc3339()
     }))
+}
+
+pub async fn metrics(State(state): State<AppState>) -> AppResult<impl IntoResponse> {
+    // Basic system metrics
+    let uptime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Get database file size if possible
+    let db_path = state.config.database_url.strip_prefix("sqlite:").unwrap_or(&state.config.database_url);
+    let db_size = std::fs::metadata(db_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "service": "little-bell",
+        "version": "0.1.0",
+        "uptime_seconds": uptime,
+        "database": {
+            "path": db_path,
+            "size_bytes": db_size
+        },
+        "memory_usage": {
+            "rss_bytes": get_memory_usage()
+        },
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+// Simple memory usage getter (Unix only)
+#[cfg(unix)]
+fn get_memory_usage() -> u64 {
+    use std::fs;
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    if let Ok(kb) = kb_str.parse::<u64>() {
+                        return kb * 1024; // Convert KB to bytes
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+#[cfg(not(unix))]
+fn get_memory_usage() -> u64 {
+    0 // Not implemented for non-Unix systems
 }
 
 pub async fn track_open(
     Path((tenant_id, email_id_str)): Path<(String, String)>,
     headers: HeaderMap,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     // Extract email ID from the path (remove .gif extension)
     let email_id_str = email_id_str.strip_suffix(".gif").unwrap_or(&email_id_str);
-    let email_id = match email_id_str.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    let email_id = email_id_str.parse::<i64>()
+        .map_err(|_| AppError::InvalidEmailId(email_id_str.to_string()))?;
 
     // Extract user agent and IP address
     let user_agent = headers
@@ -116,34 +170,42 @@ pub async fn track_open(
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
 
     // Verify email exists and belongs to tenant
-    match state.db.get_email(email_id, &tenant_id).await {
-        Ok(Some(_)) => {
+    let email = state.db.get_email(email_id, &tenant_id).await?;
+    
+    match email {
+        Some(_) => {
             // Log the open event
-            if let Err(e) = state.db.log_event(
+            state.db.log_event(
                 email_id,
                 "open",
                 user_agent.as_deref(),
                 ip_address.as_deref(),
-            ).await {
-                eprintln!("Failed to log open event: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+            ).await?;
+
+            info!(
+                tenant_id = %tenant_id,
+                email_id = %email_id,
+                ip_address = ?ip_address,
+                "Email opened"
+            );
 
             // Return 1x1 transparent GIF
             let gif_bytes = include_bytes!("pixel.gif");
-            Response::builder()
+            Ok(Response::builder()
                 .header("Content-Type", "image/gif")
                 .header("Cache-Control", "no-store, no-cache, must-revalidate")
                 .header("Pragma", "no-cache")
                 .header("Expires", "0")
                 .body(axum::body::Body::from(&gif_bytes[..]))
-                .unwrap()
-                .into_response()
+                .unwrap())
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            eprintln!("Database error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        None => {
+            warn!(
+                tenant_id = %tenant_id,
+                email_id = %email_id,
+                "Email not found for open tracking"
+            );
+            Err(AppError::EmailNotFound)
         }
     }
 }
@@ -153,7 +215,7 @@ pub async fn track_click(
     Query(params): Query<ClickQuery>,
     headers: HeaderMap,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     // Extract user agent and IP address
     let user_agent = headers
         .get("user-agent")
@@ -167,26 +229,36 @@ pub async fn track_click(
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
 
     // Verify email exists and belongs to tenant
-    match state.db.get_email(email_id, &tenant_id).await {
-        Ok(Some(_)) => {
+    let email = state.db.get_email(email_id, &tenant_id).await?;
+    
+    match email {
+        Some(_) => {
             // Log the click event
-            if let Err(e) = state.db.log_event(
+            state.db.log_event(
                 email_id,
                 "click",
                 user_agent.as_deref(),
                 ip_address.as_deref(),
-            ).await {
-                eprintln!("Failed to log click event: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+            ).await?;
+
+            info!(
+                tenant_id = %tenant_id,
+                email_id = %email_id,
+                url = %params.url,
+                ip_address = ?ip_address,
+                "Email link clicked"
+            );
 
             // Redirect to the original URL
-            Redirect::temporary(&params.url).into_response()
+            Ok(Redirect::temporary(&params.url))
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            eprintln!("Database error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        None => {
+            warn!(
+                tenant_id = %tenant_id,
+                email_id = %email_id,
+                "Email not found for click tracking"
+            );
+            Err(AppError::EmailNotFound)
         }
     }
 }
@@ -194,86 +266,72 @@ pub async fn track_click(
 pub async fn show_dashboard(
     Path(tenant_id): Path<String>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     // Ensure tenant exists (create if not)
-    if let Err(e) = state.db.create_tenant(&tenant_id, &tenant_id).await {
-        eprintln!("Failed to create/ensure tenant: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    state.db.create_tenant(&tenant_id, &tenant_id).await?;
 
     // Get statistics for the tenant
-    match state.db.get_tenant_stats(&tenant_id).await {
-        Ok(stats) => {
-            let template = DashboardTemplate {
-                tenant_id,
-                stats,
-                base_url: state.config.base_url.clone(),
-            };
-            match template.render() {
-                Ok(html) => Html(html).into_response(),
-                Err(e) => {
-                    eprintln!("Template render error: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Database error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    let stats = state.db.get_tenant_stats(&tenant_id).await?;
+    
+    let template = DashboardTemplate {
+        tenant_id,
+        stats,
+        base_url: state.config.base_url.clone(),
+    };
+    
+    let html = template.render()?;
+    Ok(Html(html))
 }
 
 pub async fn create_email(
     Path(tenant_id): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<CreateEmailRequest>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     // Ensure tenant exists (create if not)
-    if let Err(e) = state.db.create_tenant(&tenant_id, &tenant_id).await {
-        eprintln!("Failed to create/ensure tenant: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    state.db.create_tenant(&tenant_id, &tenant_id).await?;
 
     // Create email record
-    match state.db.create_email(
+    let email_id = state.db.create_email(
         &tenant_id,
         payload.subject.as_deref(),
         payload.recipient.as_deref(),
-    ).await {
-        Ok(email_id) => {
-            let tracking_pixel_url = format!(
-                "{}/{}/pixel/{}.gif",
-                state.config.base_url, tenant_id, email_id
-            );
-            
-            let response = CreateEmailResponse {
-                email_id,
-                tracking_pixel_url,
-            };
-            
-            (StatusCode::CREATED, Json(response)).into_response()
-        }
-        Err(e) => {
-            eprintln!("Failed to create email: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    ).await?;
+    
+    let tracking_pixel_url = format!(
+        "{}/{}/pixel/{}.gif",
+        state.config.base_url, tenant_id, email_id
+    );
+    
+    let response = CreateEmailResponse {
+        email_id,
+        tracking_pixel_url,
+    };
+    
+    info!(
+        tenant_id = %tenant_id,
+        email_id = %email_id,
+        subject = ?payload.subject,
+        recipient = ?payload.recipient,
+        "Email record created"
+    );
+    
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 pub async fn get_click_url(
     Path((tenant_id, email_id)): Path<(String, i64)>,
     Query(mut params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    let target_url = match params.remove("url") {
-        Some(url) => url,
-        None => return (StatusCode::BAD_REQUEST, "Missing 'url' parameter").into_response(),
-    };
+) -> AppResult<impl IntoResponse> {
+    let target_url = params.remove("url")
+        .ok_or_else(|| AppError::InvalidUrl("Missing 'url' parameter".to_string()))?;
 
     // Verify email exists and belongs to tenant
-    match state.db.get_email(email_id, &tenant_id).await {
-        Ok(Some(_)) => {
+    let email = state.db.get_email(email_id, &tenant_id).await?;
+    
+    match email {
+        Some(_) => {
             let click_url = format!(
                 "{}/{}/click/{}?url={}",
                 state.config.base_url,
@@ -281,16 +339,13 @@ pub async fn get_click_url(
                 email_id,
                 urlencoding::encode(&target_url)
             );
-            Json(serde_json::json!({
+            
+            Ok(Json(serde_json::json!({
                 "click_url": click_url,
                 "original_url": target_url
-            })).into_response()
+            })))
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            eprintln!("Database error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        None => Err(AppError::EmailNotFound)
     }
 }
 
@@ -299,11 +354,14 @@ pub async fn create_app(db: Arc<Database>, config: Config) -> Router {
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics))
         .route("/:tenant_id/pixel/:email_id", get(track_open))
         .route("/:tenant_id/click/:email_id", get(track_click))
         .route("/:tenant_id/dashboard", get(show_dashboard))
         .route("/:tenant_id/emails", post(create_email))
         .route("/:tenant_id/click-url/:email_id", get(get_click_url))
+        .layer(CorsLayer::permissive()) // Allow CORS for dashboard access
+        .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .with_state(state)
 }

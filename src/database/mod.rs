@@ -127,7 +127,7 @@ impl Database {
         let conn = self.conn.lock().await;
         
         let mut stmt = conn.prepare("SELECT id, name, created_at FROM tenants WHERE id = ?1")?;
-        let tenant_iter = stmt.query_map(params![tenant_id], |row| {
+        let mut tenant_iter = stmt.query_map(params![tenant_id], |row| {
             Ok(Tenant {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -137,7 +137,7 @@ impl Database {
             })
         })?;
 
-        for tenant in tenant_iter {
+        if let Some(tenant) = tenant_iter.next() {
             return Ok(Some(tenant?));
         }
         Ok(None)
@@ -160,7 +160,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, tenant_id, subject, recipient, created_at FROM emails WHERE id = ?1 AND tenant_id = ?2"
         )?;
-        let email_iter = stmt.query_map(params![email_id, tenant_id], |row| {
+        let mut email_iter = stmt.query_map(params![email_id, tenant_id], |row| {
             Ok(Email {
                 id: row.get(0)?,
                 tenant_id: row.get(1)?,
@@ -172,7 +172,7 @@ impl Database {
             })
         })?;
 
-        for email in email_iter {
+        if let Some(email) = email_iter.next() {
             return Ok(Some(email?));
         }
         Ok(None)
